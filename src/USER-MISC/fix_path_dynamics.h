@@ -81,6 +81,7 @@ class FixPATH_DYNAMICS : public Fix {
   
   //NEB
   void neb_force();
+  void neb_test_force();
   double veng,plen,nlen,tlen,dotpath,dot;
   double lentot,lenuntilIm,meanDist;
   double **tangent,**SpringFPerp;

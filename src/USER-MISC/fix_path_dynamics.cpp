@@ -69,6 +69,7 @@ keywords: langevin, damped, nhc, neb
    es: fix 1 all path_dynamics 0.1 1.0 0.0001 nhc 300.0 5
 
 4) 'neb' performs minimization using forces as in nudged elastic band.
+   'neb_test' same as 'neb' but I neglect the hessian part in the spring forces.
 
    Compulsory value: minimization_style.
 
@@ -169,7 +170,7 @@ using namespace LAMMPS_NS;
 using namespace FixConst;
 using namespace MathConst;
 
-enum{NHC,LANGEVIN,DAMPED,NVE,NEB};
+enum{NHC,LANGEVIN,DAMPED,NVE,NEB,NEB_TEST};
 enum{MIN_SD,MIN_DAMPED,MIN_ASD};
 #define BUFSIZE 5
 
@@ -230,6 +231,20 @@ FixPATH_DYNAMICS::FixPATH_DYNAMICS(LAMMPS *lmp, int narg, char **arg) : Fix(lmp,
           else if (strcmp(arg[iarg],"neb") == 0) {
             if ( iarg+2 > narg ) error->universe_all(FLERR,"Illegal fix path_dynamics command");
             run = NEB;
+            if (strcmp(arg[iarg+1],"sd") == 0) {
+              min_style = MIN_SD;
+            }
+            if (strcmp(arg[iarg+1],"asd") == 0) {
+              min_style = MIN_ASD;
+            }
+            if (strcmp(arg[iarg+1],"damped") == 0) {
+              min_style = MIN_DAMPED;
+            }
+            iarg+=1;
+          }
+	  else if (strcmp(arg[iarg],"neb_test") == 0) {
+            if ( iarg+2 > narg ) error->universe_all(FLERR,"Illegal fix path_dynamics command");
+            run = NEB_TEST;
             if (strcmp(arg[iarg+1],"sd") == 0) {
               min_style = MIN_SD;
             }
@@ -394,12 +409,12 @@ FixPATH_DYNAMICS::FixPATH_DYNAMICS(LAMMPS *lmp, int narg, char **arg) : Fix(lmp,
   else extraflag = 0;
 
   double **v = atom->v;
-  if ( ( run == NEB ) || ( run == DAMPED ) ) for (int i=0;i<atom->nlocal;i++) v[i][0]=v[i][1]=v[i][2]=0.0;
+  if ( ( run == NEB ) || (run == NEB_TEST) || ( run == DAMPED ) ) for (int i=0;i<atom->nlocal;i++) v[i][0]=v[i][1]=v[i][2]=0.0;
 
   // NEB
   // create a new compute pe style
   // id = fix-ID + pe, compute group = all
-  if ( run == NEB ) {
+  if ( (run == NEB) || (run == NEB_TEST) ) {
      int n = strlen(id) + 4;
      id_pe = new char[n];
      strcpy(id_pe,id);
@@ -454,7 +469,7 @@ int FixPATH_DYNAMICS::setmask()
 void FixPATH_DYNAMICS::init()
 {
   //NEB
-  if (run==NEB){
+  if ( (run == NEB) || (run == NEB_TEST) ){
   int icompute = modify->find_compute(id_pe);
   if (icompute < 0) error->universe_all(FLERR,"Potential energy ID for fix neb does not exist");
   pe = modify->compute[icompute];
@@ -516,10 +531,16 @@ void FixPATH_DYNAMICS::setup(int vflag)
       if ( min_style == MIN_ASD )    fprintf(screen,"NEB-like action minimization using accellerated steepest descent\n");
       if ( min_style == MIN_DAMPED ) fprintf(screen,"NEB-like action minimization using damped dynamics\n");
   }
+  if(me_u==0 && screen && (run==NEB_TEST)) {
+      if ( min_style == MIN_SD )     fprintf(screen,"NEB-like action minimization using steepest descent\n");
+      if ( min_style == MIN_ASD )    fprintf(screen,"NEB-like action minimization using accellerated steepest descent\n");
+      if ( min_style == MIN_DAMPED ) fprintf(screen,"NEB-like action minimization using damped dynamics\n");
+      fprintf(screen,"The hessian contribution to the spring forces will be neglected.\n");
+  }
 
   //NEB
   // trigger potential energy computation on next timestep
-  if (run==NEB) pe->addstep(update->ntimestep+1);
+  if ((run == NEB) || (run == NEB_TEST)) pe->addstep(update->ntimestep+1);
   //NEB
 
   post_force(vflag);//Compute forces and spring energy at the very beginning of simulation
@@ -532,7 +553,7 @@ void FixPATH_DYNAMICS::initial_integrate(int /*vflag*/)
 {
   //Half time step in v
   if (run == NHC) nhc_update_v();
-  else if (run == NEB) neb_update_v();
+  else if ( (run == NEB) || (run == NEB_TEST) ) neb_update_v();
   else update_v();
   //Full time-step in x
   update_x();
@@ -548,7 +569,7 @@ void FixPATH_DYNAMICS::final_integrate()
   //After this post_force is called, the post_force of any other fix defined in input is called that further modify the forces.
   //Then this final_integrate is called that performs the last half-step of Verlet
   if (run == NHC) nhc_update_v();
-  else if (run == NEB) neb_update_v();
+  else if ( (run == NEB) || (run == NEB_TEST) ) neb_update_v();
   else update_v();
 }
 
@@ -565,10 +586,11 @@ void FixPATH_DYNAMICS::post_force(int flag)
   comm_exec(atom->x);  //Communicates positions and stores them in buf_beads
 
   if ( run == NEB ) neb_force();
+  else if ( run == NEB_TEST ) neb_test_force();
   else spring_force();
 
   //Drag and stochastic forces
-  if ( ( run == DAMPED ) || ( ( run == NEB ) && ( min_style == MIN_DAMPED ) ) ) { //Damped dynamics
+  if ( ( run == DAMPED ) || ( (( run == NEB ) || (run == NEB_TEST)) && ( min_style == MIN_DAMPED ) ) ) { //Damped dynamics
 
       int *type = atom->type;
       double **v = atom->v;
@@ -1039,6 +1061,387 @@ void FixPATH_DYNAMICS::spring_force()
               delete [] eta_l;}
 
 }//END spring_force
+
+/* ----------------------------------------------------------------------
+   NEB-like force without hessian
+------------------------------------------------------------------------- */
+
+void FixPATH_DYNAMICS::neb_test_force()
+{
+  spring_energy = 0.0;
+
+  //Communicate epot for smart tangent and 'end' option
+  double vprev,vnext; //Potential energy of previous and next bead
+  int procprev,procnext;
+  double vIni=0.0;
+
+  vprev = vnext = veng = pe->compute_scalar();
+
+  if (ibead > 0) procprev = universe->root_proc[ibead-1];
+  else procprev = -1;
+
+  if (ibead < nbeads-1) procnext = universe->root_proc[ibead+1];
+  else procnext = -1;
+
+  if (ibead < nbeads-1 && me_w == 0) MPI_Send(&veng,1,MPI_DOUBLE,procnext,0,uworld);
+
+  if (ibead > 0 && me_w == 0) MPI_Recv(&vprev,1,MPI_DOUBLE,procprev,0,uworld,MPI_STATUS_IGNORE);
+
+  if (ibead > 0 && me_w == 0) MPI_Send(&veng,1,MPI_DOUBLE,procprev,0,uworld);
+
+  if (ibead < nbeads-1 && me_w == 0) MPI_Recv(&vnext,1,MPI_DOUBLE,procnext,0,uworld,MPI_STATUS_IGNORE);
+
+  MPI_Bcast(&vprev,1,MPI_DOUBLE,0,world);
+  MPI_Bcast(&vnext,1,MPI_DOUBLE,0,world);
+   
+  if ( ibead == 0 ) vIni=veng;
+  if ( me_w == 0 ) MPI_Bcast(&vIni,1,MPI_DOUBLE,0,rootworld);
+  MPI_Bcast(&vIni,1,MPI_DOUBLE,0,world);
+  //End epot comm
+
+  if ( (ibead == nbeads-1) && (update->ntimestep == 0)) EFinalIni = veng;
+  if ( (ibead == 0 ) && (update->ntimestep == 0)) EIniIni = veng;
+
+  // trigger potential energy computation on next timestep
+  pe->addstep(update->ntimestep+1);
+
+  //pos vel force owned by this proc
+  double **x = atom->x;
+  double **f = atom->f;
+  double **v = atom->v;
+  int* type = atom->type;
+  int nlocal = atom->nlocal;
+  //Positions of atoms of the two adjacent replicas
+  double* xlast = buf_beads[x_last];
+  double* xnext = buf_beads[x_next];
+  //Forces acting on atoms of the two adjacent replicas
+  double* flast = buf_force[x_last];
+  //double* fnext = buf_force[x_next];
+  //Some aux vars
+  double maxeta2,eps,maxx;
+  double dxn,dyn,dzn,dxp,dyp,dzp;
+  maxeta2 = eps = maxx = 0.0;
+  dxn = dyn = dzn = dxp = dyp = dzp = 0.0;
+  dotpath = dot = tlen = plen = nlen = 0.0;
+
+  //nlocal can change. I need to reallocate at every time step (check)
+  SpringFPerp = new double* [nlocal];
+  for (int i=0;i<nlocal;i++) SpringFPerp[i] = new double [3];
+  tangent = new double* [nlocal];
+  for (int i=0;i<nlocal;i++) tangent[i] = new double [3];
+  eta_l = new double* [nlocal];
+  for (int i=0;i<nlocal;i++) eta_l[i] = new double [3];
+  eta_n = new double* [nlocal];
+  for (int i=0;i<nlocal;i++) eta_n[i] = new double [3];
+  //Allocate aux x and f
+  x_bead = new double* [nlocal];
+  for (int i=0;i<nlocal;i++) x_bead[i] = new double [3];
+  f_bead = new double* [nlocal];
+  for (int i=0;i<nlocal;i++) f_bead[i] = new double [3];
+
+  //Store current positions
+  for (int i=0;i<nlocal;i++){ x_bead[i][0]=x[i][0]; x_bead[i][1]=x[i][1]; x_bead[i][2]=x[i][2]; }
+  //Store current force-field forces
+  for (int i=0;i<nlocal;i++){ f_bead[i][0]=f[i][0]; f_bead[i][1]=f[i][1]; f_bead[i][2]=f[i][2]; }
+
+  if ( ibead == 0 )//First bead moves according only to f_bead
+  {                //To held it fixed use "partition yes 1 fix set_force 0 0 0" in the input, after fix path_dynamics.
+	  for(int i=0; i<nlocal; i++)
+	  {
+             dxn = xnext[0] - x_bead[i][0];
+             dyn = xnext[1] - x_bead[i][1];
+             dzn = xnext[2] - x_bead[i][2];
+             domain->minimum_image(dxn,dyn,dzn);
+             //Needed for spring energy:
+             eta_n[i][0] = dxn - dt_md[type[i]] * f_bead[i][0] * force->ftm2v;
+             eta_n[i][1] = dyn - dt_md[type[i]] * f_bead[i][1] * force->ftm2v;
+             eta_n[i][2] = dzn - dt_md[type[i]] * f_bead[i][2] * force->ftm2v;
+             //NEB
+             nlen += dxn*dxn + dyn*dyn + dzn*dzn;
+             tangent[i][0]=dxn; tangent[i][1]=dyn; tangent[i][2]=dzn;
+             tlen += dxn*dxn + dyn*dyn + dzn*dzn;
+             dot += f_bead[i][0]*tangent[i][0] + f_bead[i][1]*tangent[i][1] + f_bead[i][2]*tangent[i][2];
+             //NEB
+             double msd = eta_n[i][0]*eta_n[i][0] + eta_n[i][1]*eta_n[i][1] + eta_n[i][2]*eta_n[i][2];
+       	     if (ParaSpring) spring_energy += 0.5 * kspringPara * msd * force->mvv2e;
+             else spring_energy += 0.5 * md_2dt[type[i]] * msd * force->mvv2e;
+             xnext += 3;
+	  }
+  }
+
+  else if ( ibead == nbeads-1 ) //Last bead moves according only to f_bead
+  {                             //To held it fixed use "partition yes N fix set_force 0 0 0" in the input, after fix path_dynamics.
+          for(int i=0; i<nlocal; i++)
+          {
+             dxp = x_bead[i][0] - xlast[0];
+             dyp = x_bead[i][1] - xlast[1];
+             dzp = x_bead[i][2] - xlast[2];
+             domain->minimum_image(dxp,dyp,dzp);
+             //NEB
+             plen += dxp*dxp + dyp*dyp + dzp*dzp;
+             tangent[i][0]=dxp; tangent[i][1]=dyp; tangent[i][2]=dzp;
+             tlen += dxp*dxp + dyp*dyp + dzp*dzp;
+             dot += f_bead[i][0]*tangent[i][0] + f_bead[i][1]*tangent[i][1] + f_bead[i][2]*tangent[i][2];
+             //NEB
+             xlast += 3;
+          }
+  }
+  else // bulk beads: I need to compute also the spring forces
+  {
+    double vmax = MAX(fabs(vnext-veng),fabs(vprev-veng));
+    double vmin = MIN(fabs(vnext-veng),fabs(vprev-veng));
+	  for(int i=0; i<nlocal; i++)
+          {
+            dxn = xnext[0] - x_bead[i][0];
+            dyn = xnext[1] - x_bead[i][1];
+            dzn = xnext[2] - x_bead[i][2];
+            domain->minimum_image(dxn,dyn,dzn);
+            eta_n[i][0] = dxn - dt_md[type[i]] * f_bead[i][0] * force->ftm2v;
+            eta_n[i][1] = dyn - dt_md[type[i]] * f_bead[i][1] * force->ftm2v;
+            eta_n[i][2] = dzn - dt_md[type[i]] * f_bead[i][2] * force->ftm2v;
+            dxp = x_bead[i][0] - xlast[0];
+            dyp = x_bead[i][1] - xlast[1];
+            dzp = x_bead[i][2] - xlast[2];
+            domain->minimum_image(dxp,dyp,dzp);
+	    eta_l[i][0] = dxp - dt_md[type[i]] * flast[0] * force->ftm2v;
+            eta_l[i][1] = dyp - dt_md[type[i]] * flast[1] * force->ftm2v;
+            eta_l[i][2] = dzp - dt_md[type[i]] * flast[2] * force->ftm2v;
+            //NEB
+	    if (vnext > veng && veng > vprev) {
+	      tangent[i][0] = dxn;
+	      tangent[i][1] = dyn;
+	      tangent[i][2] = dzn;
+	    } else if (vnext < veng && veng < vprev) {
+	      tangent[i][0] = dxp;
+	      tangent[i][1] = dyp;
+	      tangent[i][2] = dzp;
+	    } else {
+	        if (vnext > vprev) {
+	          tangent[i][0] = vmax*dxn + vmin*dxp;
+	          tangent[i][1] = vmax*dyn + vmin*dyp;
+	          tangent[i][2] = vmax*dzn + vmin*dzp;
+	        } else if (vnext < vprev) {
+	          tangent[i][0] = vmin*dxn + vmax*dxp;
+	          tangent[i][1] = vmin*dyn + vmax*dyp;
+	          tangent[i][2] = vmin*dzn + vmax*dzp;
+	        } else { // vnext == vprev, e.g. for potentials that do not compute an energy
+	          tangent[i][0] = dxn + dxp;
+	          tangent[i][1] = dyn + dyp;
+	          tangent[i][2] = dzn + dzp;
+	        }
+	    }
+	    plen += dxp*dxp + dyp*dyp + dzp*dzp;
+  	    nlen += dxn*dxn + dyn*dyn + dzn*dzn;
+            tlen += tangent[i][0]*tangent[i][0] + tangent[i][1]*tangent[i][1] + tangent[i][2]*tangent[i][2];
+            dotpath += dxp*dxn + dyp*dyn + dzp*dzn;
+            dot += f_bead[i][0]*tangent[i][0] + f_bead[i][1]*tangent[i][1] + f_bead[i][2]*tangent[i][2];
+            //NEB
+            double msd = eta_n[i][0]*eta_n[i][0] + eta_n[i][1]*eta_n[i][1] + eta_n[i][2]*eta_n[i][2];
+            if (ParaSpring) spring_energy += 0.5 * kspringPara * msd * force->mvv2e;
+            else spring_energy += 0.5 * md_2dt[type[i]] * msd * force->mvv2e;
+            flast += 3;
+            xlast += 3;
+            xnext += 3;
+          }
+
+          // Update spring forces
+          for (int i=0;i<nlocal;i++)
+          {   //f = ~springs~ + ~hessian~
+              if (ParaSpring) {
+                f[i][0] = kspringPara * ( eta_n[i][0] - eta_l[i][0] ) * force->mvv2e;
+                f[i][1] = kspringPara * ( eta_n[i][1] - eta_l[i][1] ) * force->mvv2e;
+                f[i][2] = kspringPara * ( eta_n[i][2] - eta_l[i][2] ) * force->mvv2e;
+              }
+              else{
+                f[i][0] = md_2dt[type[i]] * ( eta_n[i][0] - eta_l[i][0] ) * force->mvv2e;
+                f[i][1] = md_2dt[type[i]] * ( eta_n[i][1] - eta_l[i][1] ) * force->mvv2e;
+                f[i][2] = md_2dt[type[i]] * ( eta_n[i][2] - eta_l[i][2] ) * force->mvv2e;
+              }
+              if (PerpSpring) {
+                SpringFPerp[i][0] = kspringPerp * ( eta_n[i][0] - eta_l[i][0] ) * force->mvv2e;
+                SpringFPerp[i][1] = kspringPerp * ( eta_n[i][1] - eta_l[i][1] ) * force->mvv2e;
+                SpringFPerp[i][2] = kspringPerp * ( eta_n[i][2] - eta_l[i][2] ) * force->mvv2e;
+              }
+          }
+  }
+  //At this point, f_bead[][] contains the forces due to the force-field, f[][] contains the spring forces and optionally SpringFPerp contains the spring forces used only in perp direction
+
+  //Restore positions
+  for (int i=0;i<nlocal;i++){ x[i][0]=x_bead[i][0]; x[i][1]=x_bead[i][1]; x[i][2]=x_bead[i][2]; }
+
+  //Sum spring_energy from all procs in this world
+  double aux_E;
+  aux_E=0.0;
+  MPI_Allreduce(&spring_energy, &aux_E, 1, MPI_DOUBLE, MPI_SUM, world);
+  spring_energy=aux_E;
+  //Potential energy
+  potential_energy=veng;
+
+  //Reduce
+  double bufin[BUFSIZE], bufout[BUFSIZE];
+  bufin[0] = nlen;
+  bufin[1] = plen;
+  bufin[2] = tlen;
+  bufin[3] = dotpath;
+  bufin[4] = dot;
+  MPI_Allreduce(bufin,bufout,BUFSIZE,MPI_DOUBLE,MPI_SUM,world);
+  nlen = sqrt(bufout[0]);
+  plen = sqrt(bufout[1]);
+  tlen = sqrt(bufout[2]);
+  dotpath = bufout[3];
+  dot = bufout[4];
+ 
+  //Compute path related stuff
+  lentot = lenuntilIm = meanDist = 0.0;
+  double *aux_plen, *plenall;
+  aux_plen = new double [nbeads];
+  plenall  = new double [nbeads];
+  for (int i=0;i<nbeads;i++) aux_plen[i] = plenall[i] = 0.0;
+  aux_plen[ibead]=plen; //Length of this segment
+  if ( me_w == 0 ) MPI_Allreduce(aux_plen, plenall, nbeads, MPI_DOUBLE, MPI_SUM, rootworld); //Gather all segments, store in array
+  MPI_Bcast(plenall,nbeads,MPI_DOUBLE,0,world); //Communicate to all procs
+  for (int i = 0; i < ibead+1; i++) lenuntilIm += plenall[i]; // (ibead+1) goes from 1 to nbeads -> i goes from 0 to up to nbeads-1
+  for (int i = 0; i < nbeads; i++)  lentot += plenall[i];
+  meanDist = lentot/(nbeads -1);
+  delete [] aux_plen;
+  delete [] plenall;
+ 
+  //Normalize tangent and projection along tangent
+  if (tlen>0) {
+     double tlen_=1./tlen;
+     dot*=tlen_;
+     for (int i=0;i<nlocal;i++){
+        tangent[i][0]*=tlen_;
+        tangent[i][1]*=tlen_;
+        tangent[i][2]*=tlen_;
+     }
+  }
+
+  // Update forces
+  if ( ( ibead == 0 ) || ( ibead == nbeads -1  ) ) { //Just relax to local minimum
+    for (int i = 0; i < nlocal; i++){
+         f[i][0] = f_bead[i][0];
+         f[i][1] = f_bead[i][1];
+         f[i][2] = f_bead[i][2];
+    }
+  }
+
+  if ( ( ibead == 0 ) && FreeEndIni  ) { //Keep energy close to starting point
+    double prefactor = 0.0;
+    if (dot<0) prefactor = -dot - kspringIni*(veng-EIniIni);
+    else prefactor = -dot + kspringIni*(veng-EIniIni);
+    for (int i = 0; i < nlocal; i++){ 
+         f[i][0] += prefactor*tangent[i][0];
+         f[i][1] += prefactor*tangent[i][1];
+         f[i][2] += prefactor*tangent[i][2];
+    }
+  }
+
+  if ( ( ibead == nbeads-1 ) && FreeEndFinal ) { //Keep energy close to starting point
+    double prefactor = 0.0;
+    if (veng<EFinalIni) {
+        if (dot<0) prefactor = -dot - kspringFinal*(veng-EFinalIni);
+        else prefactor = -dot + kspringFinal*(veng-EFinalIni);
+    }
+    for (int i = 0; i < nlocal; i++){
+         f[i][0] += prefactor*tangent[i][0];
+         f[i][1] += prefactor*tangent[i][1];
+         f[i][2] += prefactor*tangent[i][2];
+    }
+  }
+ 
+  if ( ( ibead == nbeads-1 ) && FreeEndFinalWithRespToEIni ) { //Keep energy above that of first image
+    double prefactor = 0.0;
+    if (veng<vIni) {
+        if (dot<0) prefactor = -dot - kspringFinal*(veng-vIni);
+        else prefactor = -dot + kspringFinal*(veng-vIni);
+    }
+    for (int i = 0; i < nlocal; i++){
+         f[i][0] += prefactor*tangent[i][0];
+         f[i][1] += prefactor*tangent[i][1];
+         f[i][2] += prefactor*tangent[i][2];
+    }
+  }
+
+  if ( ( ibead > 0 ) && ( ibead < nbeads-1 ) ) { //BULK BEADS
+    double wgt;
+    dotpath = dotpath/(plen*nlen); // cosine of angle between (x_i-x_{i-1}) and (x_{i+1}-x_i)
+    wgt = 0.5 *(1+cos(MY_PI * dotpath)); // weight to keep part of perpendicular spring force in case of kinks
+
+    double dotSprTan=0.0; // dot_product(spring_force,tangent)
+    for (int i = 0; i < nlocal; i++) dotSprTan += f[i][0]*tangent[i][0] + f[i][1]*tangent[i][1] + f[i][2]*tangent[i][2];
+    double aux=0.0;
+    MPI_Allreduce(&dotSprTan,&aux,1,MPI_DOUBLE,MPI_SUM,world);
+    dotSprTan=aux;
+ 
+    double dotSprTanPerp=0.0; // dot_product(spring_force,tangent)
+    if (PerpSpring && (kspringPerp > 0.0)) {
+      for (int i = 0; i < nlocal; i++) 
+          dotSprTanPerp += SpringFPerp[i][0]*tangent[i][0] + SpringFPerp[i][1]*tangent[i][1] + SpringFPerp[i][2]*tangent[i][2];
+      double aux1=0.0;
+      MPI_Allreduce(&dotSprTanPerp,&aux1,1,MPI_DOUBLE,MPI_SUM,world);
+      dotSprTanPerp=aux1;
+    }
+
+    if (FinalAndInterWithRespToEIni && veng<vIni) {
+      for (int i = 0; i < nlocal; i++)
+        {
+          f[i][0] = dotSprTan*tangent[i][0];
+          f[i][1] = dotSprTan*tangent[i][1];
+          f[i][2] = dotSprTan*tangent[i][2];
+        }
+    }
+    else {
+
+        double pref = 0.0;
+        if ( ibead == climber ) pref = -2.0*dot;
+        else pref = -dot;
+
+        if (PerpSpring && ( kspringPerp == 0.0 )){
+          for (int i = 0; i < nlocal; i++){
+            f[i][0] = f_bead[i][0] + pref*tangent[i][0] + dotSprTan*tangent[i][0] + wgt * ( f[i][0] - dotSprTan*tangent[i][0] );
+            f[i][1] = f_bead[i][1] + pref*tangent[i][1] + dotSprTan*tangent[i][1] + wgt * ( f[i][1] - dotSprTan*tangent[i][1] );
+            f[i][2] = f_bead[i][2] + pref*tangent[i][2] + dotSprTan*tangent[i][2] + wgt * ( f[i][2] - dotSprTan*tangent[i][2] );
+          }
+        }
+        else if (PerpSpring && ( kspringPerp > 0.0 )) {
+          for (int i = 0; i < nlocal; i++){
+            f[i][0] = f_bead[i][0] + pref*tangent[i][0] + dotSprTan*tangent[i][0] + wgt * ( SpringFPerp[i][0] - dotSprTanPerp*tangent[i][0] );
+            f[i][1] = f_bead[i][1] + pref*tangent[i][1] + dotSprTan*tangent[i][1] + wgt * ( SpringFPerp[i][1] - dotSprTanPerp*tangent[i][1] );
+            f[i][2] = f_bead[i][2] + pref*tangent[i][2] + dotSprTan*tangent[i][2] + wgt * ( SpringFPerp[i][2] - dotSprTanPerp*tangent[i][2] );
+          }
+        }
+        else {
+          for (int i = 0; i < nlocal; i++){
+            f[i][0] = f_bead[i][0] + pref*tangent[i][0] + dotSprTan*tangent[i][0];
+            f[i][1] = f_bead[i][1] + pref*tangent[i][1] + dotSprTan*tangent[i][1];
+            f[i][2] = f_bead[i][2] + pref*tangent[i][2] + dotSprTan*tangent[i][2];
+          }
+        }
+    }
+
+  }//BULK BEADS
+
+  //Free aux arrays
+  if (SpringFPerp) { for(int i=0; i<nlocal; i++) {if (SpringFPerp[i]) delete [] SpringFPerp[i];}
+              delete [] SpringFPerp;}
+  if (tangent) { for(int i=0; i<nlocal; i++) {if (tangent[i]) delete [] tangent[i];}
+              delete [] tangent;}
+  if (f_fwd){ for(int i=0; i<nlocal; i++) {if (f_fwd[i]) delete [] f_fwd[i];}
+              delete [] f_fwd;}
+  if (f_bwd){ for(int i=0; i<nlocal; i++) {if (f_bwd[i]) delete [] f_bwd[i];}
+              delete [] f_bwd;}
+  if (x_bead){ for(int i=0; i<nlocal; i++) {if (x_bead[i]) delete [] x_bead[i];}
+               delete [] x_bead;}
+  if (f_bead){ for(int i=0; i<nlocal; i++) {if (f_bead[i]) delete [] f_bead[i];}
+               delete [] f_bead;}
+  if (eta_n){ for(int i=0; i<nlocal; i++) {if (eta_n[i]) delete [] eta_n[i];}
+              delete [] eta_n;}
+  if (eta_l){ for(int i=0; i<nlocal; i++) {if (eta_l[i]) delete [] eta_l[i];}
+              delete [] eta_l;}
+
+}//END neb_test_force
+
 
 /* ----------------------------------------------------------------------
    NEB-like force
