@@ -1394,7 +1394,12 @@ void FixPATH_DYNAMICS::neb_test_force()
     else {
 
         double pref = 0.0;
-        if ( ibead == climber ) pref = -2.0*dot;
+        if ( ibead == climber )
+           { 
+              pref = -2.0*dot;
+              dotSprTan = 0.0;
+              wgt = 0.0;
+           }
         else pref = -dot;
 
         if (PerpSpring && ( kspringPerp == 0.0 )){
